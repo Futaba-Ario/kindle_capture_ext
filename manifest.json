@@ -25,7 +25,10 @@
         "https://read.amazon.co.jp/*",
         "https://read.amazon.com/*"
       ],
-      "js": ["src/content/content.js"]
+      "js": [
+        "src/content/content.js"
+      ],
+      "all_frames": true
     }
   ]
 }
