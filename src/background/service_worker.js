@@ -12,7 +12,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (isCapturing) {
             sendResponse({ status: 'Already capturing' });
         } else {
-            startCaptureLoop(request.pages, request.waitMs);
+            startCaptureLoop(request.pages, request.waitMs, request.splitLimit);
             sendResponse({ status: 'Loop started' });
         }
         return false;
@@ -73,7 +73,7 @@ async function setupOffscreenDocument(path) {
     }
 }
 
-async function startCaptureLoop(totalPages, waitMs = 1500) {
+async function startCaptureLoop(totalPages, waitMs = 1500, splitLimit = 0) {
     isCapturing = true;
     try {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -89,6 +89,9 @@ async function startCaptureLoop(totalPages, waitMs = 1500) {
         // Initialize PDF in offscreen
         await chrome.runtime.sendMessage({ action: 'INIT_PDF' });
 
+        let batchIndex = 1;
+        let pagesInCurrentBatch = 0;
+
         for (let i = 0; i < totalPages; i++) {
             if (!isCapturing) break;
 
@@ -98,6 +101,16 @@ async function startCaptureLoop(totalPages, waitMs = 1500) {
 
             // Send to Offscreen
             await chrome.runtime.sendMessage({ action: 'ADD_PAGE', dataUrl: dataUrl });
+            pagesInCurrentBatch++;
+
+            // Check split logic
+            if (splitLimit > 0 && pagesInCurrentBatch >= splitLimit && i < totalPages - 1) {
+                notifyPopup(`Saving Batch ${batchIndex}...`);
+                await savePdfBatch(batchIndex);
+                batchIndex++;
+                pagesInCurrentBatch = 0;
+                await chrome.runtime.sendMessage({ action: 'INIT_PDF' });
+            }
 
             if (i < totalPages - 1) {
                 // 2. Turn Page
@@ -112,8 +125,14 @@ async function startCaptureLoop(totalPages, waitMs = 1500) {
         if (isCapturing) {
             notifyPopup('Generating PDF...');
             // Request PDF Save
-            await chrome.runtime.sendMessage({ action: 'SAVE_PDF' });
+            if (splitLimit > 0) {
+                await chrome.runtime.sendMessage({ action: 'SAVE_PDF', batchIndex: batchIndex });
+            } else {
+                await chrome.runtime.sendMessage({ action: 'SAVE_PDF' });
+            }
         }
+
+        isCapturing = false;
 
     } catch (e) {
         console.error(e);
@@ -126,7 +145,12 @@ async function startCaptureLoop(totalPages, waitMs = 1500) {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'PDF_GENERATED') {
         const dataUrl = request.dataUrl; // base64 pdf
-        const filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
+        let filename;
+        if (request.batchIndex) {
+            filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}_part${request.batchIndex}.pdf`;
+        } else {
+            filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
+        }
 
         chrome.downloads.download({
             url: dataUrl,
@@ -138,7 +162,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             } else {
                 notifyPopup('PDF Downloaded!');
             }
-            isCapturing = false;
+            // isCapturing = false; // logic moved to startCaptureLoop or handled there
         });
     }
 });
@@ -171,5 +195,18 @@ function sendPageTurn(tabId) {
 function notifyPopup(msg) {
     chrome.runtime.sendMessage({ action: 'UPDATE_STATUS', status: msg }).catch(() => {
         // Popup might be closed, ignore error
+    });
+}
+
+function savePdfBatch(batchIndex) {
+    return new Promise((resolve, reject) => {
+        const handler = (request) => {
+            if (request.action === 'PDF_GENERATED' && request.batchIndex === batchIndex) {
+                chrome.runtime.onMessage.removeListener(handler);
+                resolve();
+            }
+        };
+        chrome.runtime.onMessage.addListener(handler);
+        chrome.runtime.sendMessage({ action: 'SAVE_PDF', batchIndex: batchIndex });
     });
 }

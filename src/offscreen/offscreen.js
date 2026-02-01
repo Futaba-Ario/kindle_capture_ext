@@ -36,7 +36,11 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
             reader.readAsDataURL(blob);
             reader.onloadend = () => {
                 const base64data = reader.result;
-                chrome.runtime.sendMessage({ action: 'PDF_GENERATED', dataUrl: base64data });
+                chrome.runtime.sendMessage({
+                    action: 'PDF_GENERATED',
+                    dataUrl: base64data,
+                    batchIndex: msg.batchIndex
+                });
             };
 
             sendResponse({ status: 'Generating PDF...' });

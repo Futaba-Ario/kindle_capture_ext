@@ -27,9 +27,10 @@ document.getElementById('btn-turn-page').addEventListener('click', () => {
 document.getElementById('btn-start-loop').addEventListener('click', () => {
   const pages = parseInt(document.getElementById('input-pages').value, 10) || 10;
   const waitMs = parseInt(document.getElementById('input-wait').value, 10) || 1500;
-  setStatus(`Starting loop for ${pages} pages (Wait: ${waitMs}ms)...`);
+  const splitLimit = parseInt(document.getElementById('input-split').value, 10) || 0;
+  setStatus(`Starting loop for ${pages} pages (Wait: ${waitMs}ms, Split: ${splitLimit})...`);
 
-  chrome.runtime.sendMessage({ action: 'START_LOOP', pages: pages, waitMs: waitMs }, (response) => {
+  chrome.runtime.sendMessage({ action: 'START_LOOP', pages: pages, waitMs: waitMs, splitLimit: splitLimit }, (response) => {
     if (chrome.runtime.lastError) {
       setStatus('Error: ' + chrome.runtime.lastError.message);
     } else {
