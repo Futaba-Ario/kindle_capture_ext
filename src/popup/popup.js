@@ -2,6 +2,32 @@ function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
+function setMetrics(metrics) {
+  const lines = [
+    `Stage: ${metrics.stage || 'idle'}`,
+    `Page: ${metrics.page || 0}/${metrics.total || 0}`,
+    `Wait: ${metrics.waitMs || 0}ms`,
+    `Format: ${metrics.format || 'jpeg'}`,
+    `JPEG quality: ${metrics.jpegQuality || 0}`,
+    `Max long edge: ${metrics.maxLongEdge || 0}px`,
+    `Estimated: ${toMb(metrics.estimatedBytes || 0)}MB`,
+    `Fallback step: ${metrics.fallbackStep || 0}`
+  ];
+  document.getElementById('metrics').textContent = lines.join('\n');
+}
+
+function toMb(bytes) {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+function readInt(id, fallback) {
+  const parsed = Number.parseInt(document.getElementById(id).value, 10);
+  if (Number.isNaN(parsed)) {
+    return fallback;
+  }
+  return parsed;
+}
+
 document.getElementById('btn-capture-one').addEventListener('click', () => {
   setStatus('Requesting capture...');
   chrome.runtime.sendMessage({ action: 'CAPTURE_ONE' }, (response) => {
@@ -25,18 +51,50 @@ document.getElementById('btn-turn-page').addEventListener('click', () => {
 });
 
 document.getElementById('btn-start-loop').addEventListener('click', () => {
-  const pages = parseInt(document.getElementById('input-pages').value, 10) || 10;
-  const waitMs = parseInt(document.getElementById('input-wait').value, 10) || 1500;
-  const splitLimit = parseInt(document.getElementById('input-split').value, 10) || 0;
-  setStatus(`Starting loop for ${pages} pages (Wait: ${waitMs}ms, Split: ${splitLimit})...`);
+  const pages = readInt('input-pages', 10);
+  const waitMs = readInt('input-wait', 1500);
+  const splitLimit = readInt('input-split', 0);
+  const captureFormat = document.getElementById('input-format').value === 'png' ? 'png' : 'jpeg';
+  const jpegQuality = readInt('input-jpeg-quality', 82);
+  const maxLongEdge = readInt('input-max-long-edge', 2200);
+  const checkpointPages = readInt('input-checkpoint-pages', 20);
+  const adaptiveDelay = document.getElementById('input-adaptive-delay').value !== 'false';
+  const minWaitMs = readInt('input-min-wait', 900);
+  const maxWaitMs = readInt('input-max-wait', 3500);
 
-  chrome.runtime.sendMessage({ action: 'START_LOOP', pages: pages, waitMs: waitMs, splitLimit: splitLimit }, (response) => {
-    if (chrome.runtime.lastError) {
-      setStatus('Error: ' + chrome.runtime.lastError.message);
-    } else {
-      setStatus(response && response.status ? response.status : 'Loop started');
+  setStatus(`Starting loop: pages=${pages}, wait=${waitMs}ms, split=${splitLimit}, format=${captureFormat}`);
+
+  chrome.runtime.sendMessage({
+    action: 'START_LOOP',
+    pages,
+    waitMs,
+    splitLimit,
+    captureFormat,
+    jpegQuality,
+    maxLongEdge,
+    checkpointPages,
+    adaptiveDelay,
+    minWaitMs,
+    maxWaitMs
+  }, (response) => {
+      if (chrome.runtime.lastError) {
+        setStatus('Error: ' + chrome.runtime.lastError.message);
+      } else {
+        setStatus(response && response.status ? response.status : 'Loop started');
+      }
+      setMetrics({
+        stage: 'running',
+        page: 0,
+        total: pages,
+        waitMs,
+        format: captureFormat,
+        jpegQuality,
+        maxLongEdge,
+        estimatedBytes: 0,
+        fallbackStep: 0
+      });
     }
-  });
+  );
 });
 
 document.getElementById('btn-stop').addEventListener('click', () => {
@@ -50,5 +108,8 @@ document.getElementById('btn-stop').addEventListener('click', () => {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'UPDATE_STATUS') {
     setStatus(msg.status);
+  }
+  if (msg.action === 'UPDATE_METRICS' && msg.metrics) {
+    setMetrics(msg.metrics);
   }
 });
