@@ -28,7 +28,7 @@
       "js": [
         "src/content/content.js"
       ],
-      "all_frames": true
+      "all_frames": false
     }
   ]
 }

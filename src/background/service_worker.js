@@ -1,56 +1,109 @@
 // State
 let isCapturing = false;
+let stopRequested = false;
+
+const OFFSCREEN_DOCUMENT_PATH = 'src/offscreen/offscreen.html';
+const PDF_SAVE_TIMEOUT_MS = 30_000;
+const MIN_CAPTURE_INTERVAL_MS = 550;
+const CAPTURE_RETRY_DELAY_MS = 700;
+const MAX_CAPTURE_RETRIES = 4;
+
+let lastCaptureAtMs = 0;
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'CAPTURE_ONE') {
         handleCaptureOne(sendResponse);
-        return true; // Keep channel open for async response
-    } else if (request.action === 'TURN_PAGE') {
+        return true;
+    }
+
+    if (request.action === 'TURN_PAGE') {
         handlePageTurn(sendResponse);
         return true;
-    } else if (request.action === 'START_LOOP') {
+    }
+
+    if (request.action === 'START_LOOP') {
         if (isCapturing) {
             sendResponse({ status: 'Already capturing' });
         } else {
-            startCaptureLoop(request.pages, request.waitMs, request.splitLimit);
+            startCaptureLoop(request.pages, request.waitMs, request.splitLimit).catch((error) => {
+                console.error('Capture loop failed unexpectedly:', error);
+            });
             sendResponse({ status: 'Loop started' });
         }
         return false;
-    } else if (request.action === 'STOP_LOOP') {
-        isCapturing = false;
-        sendResponse({ status: 'Stop flag set' });
+    }
+
+    if (request.action === 'STOP_LOOP') {
+        if (!isCapturing) {
+            sendResponse({ status: 'Not capturing' });
+            return false;
+        }
+
+        stopRequested = true;
+        notifyPopup('Stop request accepted. Finishing current page...');
+        sendResponse({ status: 'Stop request accepted. Partial PDF will be saved.' });
         return false;
+    }
+
+    return false;
+});
+
+chrome.runtime.onMessage.addListener((request) => {
+    if (request.action === 'PDF_GENERATED') {
+        const dataUrl = request.dataUrl;
+        const partSuffix = request.batchIndex ? `_part${request.batchIndex}` : '';
+        const filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}${partSuffix}.pdf`;
+
+        chrome.downloads.download({
+            url: dataUrl,
+            filename,
+            saveAs: false
+        }, () => {
+            if (chrome.runtime.lastError) {
+                notifyPopup('Download Error: ' + chrome.runtime.lastError.message);
+            } else if (request.batchIndex) {
+                notifyPopup(`Part ${request.batchIndex} downloaded.`);
+            } else {
+                notifyPopup('PDF downloaded.');
+            }
+        });
+    } else if (request.action === 'PDF_GENERATION_FAILED') {
+        const partLabel = request.batchIndex ? ` (part ${request.batchIndex})` : '';
+        notifyPopup(`PDF generation failed${partLabel}: ${request.error || 'Unknown error'}`);
     }
 });
 
 async function handlePageTurn(sendResponse) {
-    // ... existing handlePageTurn logic reused or kept ...
-    // Simplified for brevity in this replacement block, but ensuring we don't lose the wrapper
     try {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (!tab) { sendResponse({ status: 'No active tab' }); return; }
-        await sendPageTurn(tab.id);
-        sendResponse({ status: 'Turned' });
-    } catch (e) {
-        sendResponse({ status: 'Error: ' + e.message });
+        if (!tab) {
+            sendResponse({ status: 'No active tab' });
+            return;
+        }
+
+        const result = await sendPageTurn(tab.id);
+        sendResponse({ status: result && result.status ? result.status : 'Turned' });
+    } catch (error) {
+        sendResponse({ status: 'Error: ' + error.message });
     }
 }
 
 async function handleCaptureOne(sendResponse) {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!tab) { sendResponse({ status: 'No active tab' }); return; }
+        if (!tab) {
+            sendResponse({ status: 'No active tab' });
+            return;
+        }
+
         await captureAndDownload(tab.windowId, 1);
         sendResponse({ status: 'Captured' });
-    } catch (e) {
-        sendResponse({ status: 'Error: ' + e.message });
+    } catch (error) {
+        sendResponse({ status: 'Error: ' + error.message });
     }
 }
 
-const OFFSCREEN_DOCUMENT_PATH = 'src/offscreen/offscreen.html';
-
 async function setupOffscreenDocument(path) {
-    // Check if offscreen document already exists
     const existingContexts = await chrome.runtime.getContexts({
         contextTypes: ['OFFSCREEN_DOCUMENT'],
         documentUrls: [chrome.runtime.getURL(path)]
@@ -60,153 +113,251 @@ async function setupOffscreenDocument(path) {
         return;
     }
 
-    // Create offscreen document
-    if (chrome.offscreen) {
-        await chrome.offscreen.createDocument({
-            url: path,
-            reasons: ['BLOBS'],
-            justification: 'To generate PDF from captured images'
-        });
-    } else {
-        // Fallback for older Chrome versions if needed, or error
+    if (!chrome.offscreen) {
         throw new Error('Offscreen API not available');
     }
+
+    await chrome.offscreen.createDocument({
+        url: path,
+        reasons: ['BLOBS'],
+        justification: 'To generate PDF from captured images'
+    });
 }
 
 async function startCaptureLoop(totalPages, waitMs = 1500, splitLimit = 0) {
+    const targetPages = Math.max(1, Number(totalPages) || 1);
+    const turnWaitMs = Math.max(0, Number(waitMs) || 1500);
+    const splitPageLimit = Math.max(0, Number(splitLimit) || 0);
+
     isCapturing = true;
+    stopRequested = false;
+
     try {
         const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         if (!tab) {
-            console.error('No active tab');
-            isCapturing = false;
-            return;
+            throw new Error('No active tab');
         }
 
         notifyPopup('Initializing PDF setup...');
         await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
-
-        // Initialize PDF in offscreen
-        await chrome.runtime.sendMessage({ action: 'INIT_PDF' });
+        await sendRuntimeMessage({ action: 'INIT_PDF' });
 
         let batchIndex = 1;
         let pagesInCurrentBatch = 0;
+        let capturedPages = 0;
 
-        for (let i = 0; i < totalPages; i++) {
-            if (!isCapturing) break;
+        for (let i = 0; i < targetPages; i++) {
+            if (stopRequested) {
+                break;
+            }
 
-            // 1. Capture
-            notifyPopup(`Capturing page ${i + 1}/${totalPages}...`);
-            const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+            notifyPopup(`Capturing page ${i + 1}/${targetPages}...`);
+            const dataUrl = await captureVisibleTabWithThrottle(tab.windowId);
+            await sendRuntimeMessage({ action: 'ADD_PAGE', dataUrl });
 
-            // Send to Offscreen
-            await chrome.runtime.sendMessage({ action: 'ADD_PAGE', dataUrl: dataUrl });
             pagesInCurrentBatch++;
+            capturedPages++;
 
-            // Check split logic
-            if (splitLimit > 0 && pagesInCurrentBatch >= splitLimit && i < totalPages - 1) {
-                notifyPopup(`Saving Batch ${batchIndex}...`);
-                await savePdfBatch(batchIndex);
+            if (splitPageLimit > 0 && pagesInCurrentBatch >= splitPageLimit && i < targetPages - 1) {
+                notifyPopup(`Saving part ${batchIndex}...`);
+                await savePdfAndWait(batchIndex, PDF_SAVE_TIMEOUT_MS);
+
                 batchIndex++;
                 pagesInCurrentBatch = 0;
-                await chrome.runtime.sendMessage({ action: 'INIT_PDF' });
+
+                if (!stopRequested) {
+                    await sendRuntimeMessage({ action: 'INIT_PDF' });
+                }
             }
 
-            if (i < totalPages - 1) {
-                // 2. Turn Page
+            if (i < targetPages - 1 && !stopRequested) {
                 notifyPopup(`Turning page ${i + 1}...`);
-                await sendPageTurn(tab.id);
+                const turnResult = await sendPageTurn(tab.id);
+                if (turnResult && turnResult.status) {
+                    notifyPopup(turnResult.status);
+                }
 
-                // 3. Wait
-                await new Promise(r => setTimeout(r, waitMs));
+                if (turnWaitMs > 0) {
+                    await delay(turnWaitMs);
+                }
             }
         }
 
-        if (isCapturing) {
-            notifyPopup('Generating PDF...');
-            // Request PDF Save
-            if (splitLimit > 0) {
-                await chrome.runtime.sendMessage({ action: 'SAVE_PDF', batchIndex: batchIndex });
+        if (pagesInCurrentBatch > 0) {
+            if (stopRequested) {
+                notifyPopup('Saving partial PDF before stop...');
             } else {
-                await chrome.runtime.sendMessage({ action: 'SAVE_PDF' });
+                notifyPopup('Generating PDF...');
             }
+
+            const finalBatchIndex = splitPageLimit > 0 ? batchIndex : undefined;
+            await savePdfAndWait(finalBatchIndex, PDF_SAVE_TIMEOUT_MS);
         }
 
+        if (stopRequested) {
+            if (capturedPages > 0) {
+                notifyPopup('Stopped. Partial PDF saved.');
+            } else {
+                notifyPopup('Stopped before capturing any pages.');
+            }
+        } else {
+            notifyPopup('Capture complete.');
+        }
+    } catch (error) {
+        console.error(error);
+        notifyPopup('Error: ' + error.message);
+    } finally {
         isCapturing = false;
-
-    } catch (e) {
-        console.error(e);
-        notifyPopup('Error: ' + e.message);
-        isCapturing = false;
+        stopRequested = false;
     }
 }
 
-// Listen for PDF generation completion
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === 'PDF_GENERATED') {
-        const dataUrl = request.dataUrl; // base64 pdf
-        let filename;
-        if (request.batchIndex) {
-            filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}_part${request.batchIndex}.pdf`;
-        } else {
-            filename = `kindle_book_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
-        }
-
-        chrome.downloads.download({
-            url: dataUrl,
-            filename: filename,
-            saveAs: false
-        }, (downloadId) => {
-            if (chrome.runtime.lastError) {
-                notifyPopup('Download Error: ' + chrome.runtime.lastError.message);
-            } else {
-                notifyPopup('PDF Downloaded!');
-            }
-            // isCapturing = false; // logic moved to startCaptureLoop or handled there
-        });
-    }
-});
-
 async function captureAndDownload(windowId, pageNum) {
-    const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+    const dataUrl = await captureVisibleTabWithThrottle(windowId);
     const filename = `kindle_capture_${String(pageNum).padStart(3, '0')}.png`;
 
-    // We want to await the download ID to ensure it's queued, 
-    // but we don't strictly need to wait for completion for this PoC.
     await chrome.downloads.download({
         url: dataUrl,
-        filename: filename,
+        filename,
         saveAs: false
     });
 }
 
 function sendPageTurn(tabId) {
     return new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(tabId, { action: 'SC_TURN_PAGE' }, (response) => {
+        chrome.tabs.sendMessage(tabId, { action: 'SC_TURN_PAGE' }, { frameId: 0 }, (response) => {
             if (chrome.runtime.lastError) {
-                reject(chrome.runtime.lastError);
-            } else {
-                resolve(response);
+                const message = chrome.runtime.lastError.message || 'Unknown tab messaging error';
+                if (message.includes('Could not establish connection')) {
+                    reject(new Error('Top-frame content script connection failed: ' + message));
+                    return;
+                }
+                reject(new Error(message));
+                return;
+            }
+
+            if (response && response.status && response.status.startsWith('Turn failed')) {
+                reject(new Error(response.status));
+                return;
+            }
+
+            resolve(response || { status: 'Turned' });
+        });
+    });
+}
+
+function savePdfAndWait(expectedBatchIndex, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timeoutId = null;
+
+        const cleanup = () => {
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+            }
+            chrome.runtime.onMessage.removeListener(handler);
+        };
+
+        const settle = (callback, value) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            cleanup();
+            callback(value);
+        };
+
+        const handler = (request) => {
+            if (request.action === 'PDF_GENERATED' && isExpectedBatch(request.batchIndex, expectedBatchIndex)) {
+                settle(resolve);
+            } else if (request.action === 'PDF_GENERATION_FAILED' && isExpectedBatch(request.batchIndex, expectedBatchIndex)) {
+                settle(reject, new Error(request.error || 'PDF generation failed'));
+            }
+        };
+
+        chrome.runtime.onMessage.addListener(handler);
+
+        timeoutId = setTimeout(() => {
+            const partLabel = expectedBatchIndex ? ` for part ${expectedBatchIndex}` : '';
+            settle(reject, new Error(`Timed out waiting for PDF generation${partLabel}`));
+        }, timeoutMs);
+
+        const message = expectedBatchIndex ? { action: 'SAVE_PDF', batchIndex: expectedBatchIndex } : { action: 'SAVE_PDF' };
+        chrome.runtime.sendMessage(message, (response) => {
+            if (chrome.runtime.lastError) {
+                settle(reject, new Error(chrome.runtime.lastError.message));
+                return;
+            }
+
+            if (response && typeof response.status === 'string' && response.status.startsWith('Error')) {
+                settle(reject, new Error(response.status));
             }
         });
     });
 }
 
-function notifyPopup(msg) {
-    chrome.runtime.sendMessage({ action: 'UPDATE_STATUS', status: msg }).catch(() => {
-        // Popup might be closed, ignore error
+function isExpectedBatch(receivedBatchIndex, expectedBatchIndex) {
+    if (expectedBatchIndex === undefined || expectedBatchIndex === null) {
+        return receivedBatchIndex === undefined || receivedBatchIndex === null;
+    }
+    return receivedBatchIndex === expectedBatchIndex;
+}
+
+function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(message, (response) => {
+            if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+            }
+
+            if (response && typeof response.status === 'string' && response.status.startsWith('Error')) {
+                reject(new Error(response.status));
+                return;
+            }
+
+            resolve(response);
+        });
     });
 }
 
-function savePdfBatch(batchIndex) {
-    return new Promise((resolve, reject) => {
-        const handler = (request) => {
-            if (request.action === 'PDF_GENERATED' && request.batchIndex === batchIndex) {
-                chrome.runtime.onMessage.removeListener(handler);
-                resolve();
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function captureVisibleTabWithThrottle(windowId) {
+    const now = Date.now();
+    const elapsed = now - lastCaptureAtMs;
+    if (elapsed < MIN_CAPTURE_INTERVAL_MS) {
+        await delay(MIN_CAPTURE_INTERVAL_MS - elapsed);
+    }
+
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAX_CAPTURE_RETRIES; attempt++) {
+        try {
+            const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+            lastCaptureAtMs = Date.now();
+            return dataUrl;
+        } catch (error) {
+            lastError = error;
+            const message = String(error && error.message ? error.message : error);
+            const quotaHit = message.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND');
+
+            if (!quotaHit || attempt === MAX_CAPTURE_RETRIES) {
+                throw error;
             }
-        };
-        chrome.runtime.onMessage.addListener(handler);
-        chrome.runtime.sendMessage({ action: 'SAVE_PDF', batchIndex: batchIndex });
+
+            notifyPopup('Capture quota reached. Retrying...');
+            await delay(CAPTURE_RETRY_DELAY_MS);
+        }
+    }
+
+    throw lastError || new Error('captureVisibleTab failed');
+}
+
+function notifyPopup(msg) {
+    chrome.runtime.sendMessage({ action: 'UPDATE_STATUS', status: msg }).catch(() => {
+        // Popup might be closed.
     });
 }
