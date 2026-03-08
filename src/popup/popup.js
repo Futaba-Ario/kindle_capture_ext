@@ -2,6 +2,25 @@ function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
+const manualPagesInput = document.getElementById('input-pages');
+const manualPagesLabel = document.getElementById('manual-pages-label');
+const captureModeInputs = Array.from(document.querySelectorAll('input[name="capture-mode"]'));
+
+function getSelectedCaptureMode() {
+  const selected = captureModeInputs.find((input) => input.checked);
+  return selected ? selected.value : 'auto';
+}
+
+function syncCaptureModeUi() {
+  const isManualMode = getSelectedCaptureMode() === 'manual';
+  manualPagesInput.disabled = !isManualMode;
+  manualPagesLabel.classList.toggle('field-disabled', !isManualMode);
+}
+
+captureModeInputs.forEach((input) => {
+  input.addEventListener('change', syncCaptureModeUi);
+});
+
 document.getElementById('btn-capture-one').addEventListener('click', () => {
   setStatus('Requesting capture...');
   chrome.runtime.sendMessage({ action: 'CAPTURE_ONE' }, (response) => {
@@ -25,12 +44,28 @@ document.getElementById('btn-turn-page').addEventListener('click', () => {
 });
 
 document.getElementById('btn-start-loop').addEventListener('click', () => {
-  const pages = parseInt(document.getElementById('input-pages').value, 10) || 10;
+  const mode = getSelectedCaptureMode();
+  const manualPages = parseInt(manualPagesInput.value, 10);
   const waitMs = parseInt(document.getElementById('input-wait').value, 10) || 1500;
   const splitLimit = parseInt(document.getElementById('input-split').value, 10) || 0;
-  setStatus(`Starting loop for ${pages} pages (Wait: ${waitMs}ms, Split: ${splitLimit})...`);
 
-  chrome.runtime.sendMessage({ action: 'START_LOOP', pages: pages, waitMs: waitMs, splitLimit: splitLimit }, (response) => {
+  if (mode === 'manual' && (!Number.isInteger(manualPages) || manualPages <= 0)) {
+    setStatus('Error: Manual mode requires a page count of 1 or more.');
+    return;
+  }
+
+  const startLabel = mode === 'auto'
+    ? `Starting capture (Auto, Wait: ${waitMs}ms, Split: ${splitLimit})...`
+    : `Starting capture (Manual: ${manualPages} pages, Wait: ${waitMs}ms, Split: ${splitLimit})...`;
+  setStatus(startLabel);
+
+  chrome.runtime.sendMessage({
+    action: 'START_LOOP',
+    mode,
+    manualPages: mode === 'manual' ? manualPages : undefined,
+    waitMs,
+    splitLimit
+  }, (response) => {
     if (chrome.runtime.lastError) {
       setStatus('Error: ' + chrome.runtime.lastError.message);
     } else {
@@ -52,3 +87,5 @@ chrome.runtime.onMessage.addListener((msg) => {
     setStatus(msg.status);
   }
 });
+
+syncCaptureModeUi();

@@ -25,7 +25,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (isCapturing) {
             sendResponse({ status: 'Already capturing' });
         } else {
-            startCaptureLoop(request.pages, request.waitMs, request.splitLimit).catch((error) => {
+            startCaptureLoop({
+                mode: request.mode,
+                manualPages: request.manualPages ?? request.pages,
+                waitMs: request.waitMs,
+                splitLimit: request.splitLimit
+            }).catch((error) => {
                 console.error('Capture loop failed unexpectedly:', error);
             });
             sendResponse({ status: 'Loop started' });
@@ -124,10 +129,25 @@ async function setupOffscreenDocument(path) {
     });
 }
 
-async function startCaptureLoop(totalPages, waitMs = 1500, splitLimit = 0) {
-    const targetPages = Math.max(1, Number(totalPages) || 1);
-    const turnWaitMs = Math.max(0, Number(waitMs) || 1500);
-    const splitPageLimit = Math.max(0, Number(splitLimit) || 0);
+async function startCaptureLoop(options = {}) {
+    const captureMode = normalizeCaptureMode(options.mode);
+    const manualTargetPages = parsePositiveInteger(options.manualPages);
+    const turnWaitMs = Math.max(0, Number(options.waitMs) || 1500);
+    const splitPageLimit = Math.max(0, Number(options.splitLimit) || 0);
+
+    if (captureMode === 'manual' && manualTargetPages === null) {
+        throw new Error('Manual mode requires a page count of 1 or more.');
+    }
+
+    const session = {
+        tab: null,
+        turnWaitMs,
+        splitPageLimit,
+        batchIndex: 1,
+        pagesInCurrentBatch: 0,
+        capturedPages: 0,
+        isSavingPdf: false
+    };
 
     isCapturing = true;
     stopRequested = false;
@@ -137,65 +157,23 @@ async function startCaptureLoop(totalPages, waitMs = 1500, splitLimit = 0) {
         if (!tab) {
             throw new Error('No active tab');
         }
+        session.tab = tab;
 
         notifyPopup('Initializing PDF setup...');
         await setupOffscreenDocument(OFFSCREEN_DOCUMENT_PATH);
         await sendRuntimeMessage({ action: 'INIT_PDF' });
 
-        let batchIndex = 1;
-        let pagesInCurrentBatch = 0;
-        let capturedPages = 0;
-
-        for (let i = 0; i < targetPages; i++) {
-            if (stopRequested) {
-                break;
-            }
-
-            notifyPopup(`Capturing page ${i + 1}/${targetPages}...`);
-            const dataUrl = await captureVisibleTabWithThrottle(tab.windowId);
-            await sendRuntimeMessage({ action: 'ADD_PAGE', dataUrl });
-
-            pagesInCurrentBatch++;
-            capturedPages++;
-
-            if (splitPageLimit > 0 && pagesInCurrentBatch >= splitPageLimit && i < targetPages - 1) {
-                notifyPopup(`Saving part ${batchIndex}...`);
-                await savePdfAndWait(batchIndex, PDF_SAVE_TIMEOUT_MS);
-
-                batchIndex++;
-                pagesInCurrentBatch = 0;
-
-                if (!stopRequested) {
-                    await sendRuntimeMessage({ action: 'INIT_PDF' });
-                }
-            }
-
-            if (i < targetPages - 1 && !stopRequested) {
-                notifyPopup(`Turning page ${i + 1}...`);
-                const turnResult = await sendPageTurn(tab.id);
-                if (turnResult && turnResult.status) {
-                    notifyPopup(turnResult.status);
-                }
-
-                if (turnWaitMs > 0) {
-                    await delay(turnWaitMs);
-                }
-            }
+        if (captureMode === 'auto') {
+            await runAutoCapture(session);
+        } else {
+            notifyPopup(`Starting manual capture for ${manualTargetPages} pages.`);
+            await runManualCapture(session, manualTargetPages);
         }
 
-        if (pagesInCurrentBatch > 0) {
-            if (stopRequested) {
-                notifyPopup('Saving partial PDF before stop...');
-            } else {
-                notifyPopup('Generating PDF...');
-            }
-
-            const finalBatchIndex = splitPageLimit > 0 ? batchIndex : undefined;
-            await savePdfAndWait(finalBatchIndex, PDF_SAVE_TIMEOUT_MS);
-        }
+        await finalizePendingPdf(session, stopRequested ? 'stop' : 'complete');
 
         if (stopRequested) {
-            if (capturedPages > 0) {
+            if (session.capturedPages > 0) {
                 notifyPopup('Stopped. Partial PDF saved.');
             } else {
                 notifyPopup('Stopped before capturing any pages.');
@@ -205,7 +183,7 @@ async function startCaptureLoop(totalPages, waitMs = 1500, splitLimit = 0) {
         }
     } catch (error) {
         console.error(error);
-        notifyPopup('Error: ' + error.message);
+        await handleCaptureLoopError(error, session);
     } finally {
         isCapturing = false;
         stopRequested = false;
@@ -224,24 +202,40 @@ async function captureAndDownload(windowId, pageNum) {
 }
 
 function sendPageTurn(tabId) {
+    return sendTopFrameMessage(tabId, { action: 'SC_TURN_PAGE' }).then((response) => {
+        if (response && response.status && response.status.startsWith('Turn failed')) {
+            throw new Error(response.status);
+        }
+
+        return response || { status: 'Turned' };
+    });
+}
+
+function getReaderProgress(tabId) {
+    return sendTopFrameMessage(tabId, { action: 'SC_GET_READER_PROGRESS' }).then((response) => {
+        if (!response || !Number.isInteger(response.currentPage) || !Number.isInteger(response.totalPages) || typeof response.source !== 'string') {
+            const errorMessage = response && response.status ? response.status : 'Reader progress unavailable';
+            throw new Error(errorMessage);
+        }
+
+        return response;
+    });
+}
+
+function sendTopFrameMessage(tabId, message) {
     return new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(tabId, { action: 'SC_TURN_PAGE' }, { frameId: 0 }, (response) => {
+        chrome.tabs.sendMessage(tabId, message, { frameId: 0 }, (response) => {
             if (chrome.runtime.lastError) {
-                const message = chrome.runtime.lastError.message || 'Unknown tab messaging error';
-                if (message.includes('Could not establish connection')) {
-                    reject(new Error('Top-frame content script connection failed: ' + message));
+                const lastErrorMessage = chrome.runtime.lastError.message || 'Unknown tab messaging error';
+                if (lastErrorMessage.includes('Could not establish connection')) {
+                    reject(new Error('Top-frame content script connection failed: ' + lastErrorMessage));
                     return;
                 }
-                reject(new Error(message));
+                reject(new Error(lastErrorMessage));
                 return;
             }
 
-            if (response && response.status && response.status.startsWith('Turn failed')) {
-                reject(new Error(response.status));
-                return;
-            }
-
-            resolve(response || { status: 'Turned' });
+            resolve(response);
         });
     });
 }
@@ -325,6 +319,23 @@ function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeCaptureMode(value) {
+    if (value === undefined || value === null || value === '') {
+        return 'auto';
+    }
+
+    if (value === 'auto' || value === 'manual') {
+        return value;
+    }
+
+    throw new Error(`Unknown capture mode: ${value}`);
+}
+
+function parsePositiveInteger(value) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 async function captureVisibleTabWithThrottle(windowId) {
     const now = Date.now();
     const elapsed = now - lastCaptureAtMs;
@@ -361,3 +372,148 @@ function notifyPopup(msg) {
         // Popup might be closed.
     });
 }
+
+async function runAutoCapture(session) {
+    notifyPopup('Detecting reader progress...');
+
+    let detectedProgress;
+    try {
+        detectedProgress = await getReaderProgress(session.tab.id);
+    } catch (error) {
+        throw new Error(`Auto mode could not detect reader progress: ${error.message}`);
+    }
+
+    notifyPopup(`Detected current ${detectedProgress.currentPage}/${detectedProgress.totalPages} via ${detectedProgress.source}.`);
+    await runProgressAwareCapture(session, detectedProgress);
+}
+
+async function runProgressAwareCapture(session, initialProgress) {
+    let progress = initialProgress;
+
+    while (!stopRequested) {
+        notifyPopup(`Capturing page ${progress.currentPage}/${progress.totalPages}...`);
+        await captureCurrentPage(session);
+
+        const hasMorePages = progress.currentPage < progress.totalPages;
+        await maybeSaveSplitBatch(session, hasMorePages && !stopRequested);
+
+        if (!hasMorePages || stopRequested) {
+            return;
+        }
+
+        notifyPopup(`Turning page ${progress.currentPage}/${progress.totalPages}...`);
+        const turnResult = await sendPageTurn(session.tab.id);
+        if (turnResult && turnResult.status) {
+            notifyPopup(turnResult.status);
+        }
+
+        if (session.turnWaitMs > 0) {
+            await delay(session.turnWaitMs);
+        }
+
+        const nextProgress = await getReaderProgress(session.tab.id);
+        if (nextProgress.currentPage <= progress.currentPage) {
+            throw new Error(`Reader progress did not advance after page turn (${progress.currentPage}/${progress.totalPages} -> ${nextProgress.currentPage}/${nextProgress.totalPages}).`);
+        }
+
+        progress = nextProgress;
+    }
+}
+
+async function runManualCapture(session, targetPages) {
+    for (let i = 0; i < targetPages; i++) {
+        if (stopRequested) {
+            return;
+        }
+
+        notifyPopup(`Capturing page ${i + 1}/${targetPages}...`);
+        await captureCurrentPage(session);
+
+        const hasMorePages = i < targetPages - 1;
+        await maybeSaveSplitBatch(session, hasMorePages && !stopRequested);
+
+        if (!hasMorePages || stopRequested) {
+            return;
+        }
+
+        notifyPopup(`Turning page ${i + 1}/${targetPages}...`);
+        const turnResult = await sendPageTurn(session.tab.id);
+        if (turnResult && turnResult.status) {
+            notifyPopup(turnResult.status);
+        }
+
+        if (session.turnWaitMs > 0) {
+            await delay(session.turnWaitMs);
+        }
+    }
+}
+
+async function captureCurrentPage(session) {
+    const dataUrl = await captureVisibleTabWithThrottle(session.tab.windowId);
+    await sendRuntimeMessage({ action: 'ADD_PAGE', dataUrl });
+    session.pagesInCurrentBatch++;
+    session.capturedPages++;
+}
+
+async function maybeSaveSplitBatch(session, shouldContinue) {
+    if (session.splitPageLimit <= 0 || session.pagesInCurrentBatch < session.splitPageLimit || !shouldContinue) {
+        return;
+    }
+
+    notifyPopup(`Saving part ${session.batchIndex}...`);
+    await saveCurrentBatch(session, session.batchIndex);
+    session.batchIndex++;
+    session.pagesInCurrentBatch = 0;
+
+    if (!stopRequested) {
+        await sendRuntimeMessage({ action: 'INIT_PDF' });
+    }
+}
+
+async function finalizePendingPdf(session, reason) {
+    if (session.pagesInCurrentBatch <= 0) {
+        return false;
+    }
+
+    if (reason === 'stop') {
+        notifyPopup('Saving partial PDF before stop...');
+    } else if (reason === 'error') {
+        notifyPopup('Saving partial PDF after error...');
+    } else {
+        notifyPopup('Generating PDF...');
+    }
+
+    const finalBatchIndex = session.splitPageLimit > 0 ? session.batchIndex : undefined;
+    await saveCurrentBatch(session, finalBatchIndex);
+    session.pagesInCurrentBatch = 0;
+    return true;
+}
+
+async function saveCurrentBatch(session, batchIndex) {
+    session.isSavingPdf = true;
+    try {
+        await savePdfAndWait(batchIndex, PDF_SAVE_TIMEOUT_MS);
+    } finally {
+        session.isSavingPdf = false;
+    }
+}
+
+async function handleCaptureLoopError(error, session) {
+    let errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (session && session.pagesInCurrentBatch > 0 && !session.isSavingPdf) {
+        try {
+            await finalizePendingPdf(session, 'error');
+            errorMessage += ' Partial PDF saved.';
+        } catch (saveError) {
+            console.error('Failed to save partial PDF after error:', saveError);
+            const saveMessage = saveError instanceof Error ? saveError.message : String(saveError);
+            errorMessage += ` Partial PDF save failed: ${saveMessage}`;
+        }
+    }
+
+    notifyPopup('Error: ' + errorMessage);
+}
+
+
+

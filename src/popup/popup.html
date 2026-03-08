@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <style>
     body {
-      width: 250px;
+      width: 280px;
       padding: 10px;
       font-family: sans-serif;
     }
@@ -22,6 +22,14 @@
       color: #666;
       margin-top: 5px;
     }
+
+    .mode-group {
+      margin-bottom: 8px;
+    }
+
+    .field-disabled {
+      opacity: 0.6;
+    }
   </style>
 </head>
 
@@ -30,9 +38,13 @@
   <button id="btn-capture-one">1枚だけ撮る (PoC)</button>
   <button id="btn-turn-page">ページ送りテスト (PoC)</button>
   <hr>
-  <label>ページ数: <input type="number" id="input-pages" value="10" style="width: 50px;"></label><br>
-  <label>待機(ms): <input type="number" id="input-wait" value="1500" style="width: 50px;"></label><br>
-  <label>分割(頁): <input type="number" id="input-split" value="0" style="width: 50px;" title="0で分割なし"></label>
+  <div class="mode-group">
+    <label><input type="radio" name="capture-mode" value="auto" checked> ページ数を自動取得</label><br>
+    <label><input type="radio" name="capture-mode" value="manual"> ページ数を手動入力</label>
+  </div>
+  <label id="manual-pages-label" class="field-disabled">撮影ページ数: <input type="number" id="input-pages" value="10" min="1" style="width: 50px;" disabled></label><br>
+  <label>待機(ms): <input type="number" id="input-wait" value="1500" min="0" style="width: 50px;"></label><br>
+  <label>分割(頁): <input type="number" id="input-split" value="0" min="0" style="width: 50px;" title="0で分割なし"></label>
   <div style="display: flex; gap: 5px; margin-top: 5px;">
     <button id="btn-start-loop" style="background-color: #e7f3fe;">開始 (PDF)</button>
     <button id="btn-stop" style="background-color: #fee;">停止</button>
